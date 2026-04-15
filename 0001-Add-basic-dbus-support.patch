@@ -1,0 +1,366 @@
+From 00e7c3720367f880da95c8bbe7cd163c34b6e5a8 Mon Sep 17 00:00:00 2001
+From: dabao1955 <dabao1955@163.com>
+Date: Sat, 11 Apr 2026 19:49:36 +0800
+Subject: [PATCH] Add basic dbus support
+
+---
+ src/chroot.c       | 219 +++++++++++++++++++++++++--------------------
+ src/config.c       |  31 ++++++-
+ src/include/ruri.h |   4 +-
+ src/info.c         |   3 +-
+ src/ruri.c         |   2 -
+ 5 files changed, 151 insertions(+), 108 deletions(-)
+
+diff --git a/src/chroot.c b/src/chroot.c
+index 28380fc..2986c43 100644
+--- a/src/chroot.c
++++ b/src/chroot.c
+@@ -110,6 +110,124 @@ static void check_binary(const struct RURI_CONTAINER *_Nonnull container)
+ 		}
+ 	}
+ }
++/*
++ * Generate a unique machine-id for systemd.
++ * Based on container_id and current time.
++ */
++#ifndef DISABLE_SYSTEMD
++static void generate_machine_id(int container_id)
++{
++	unsigned int machine_id_seed = (unsigned int)time(NULL) ^ (unsigned int)container_id;
++	char new_machine_id[33];
++	const char *hex_chars = "0123456789abcdef";
++	for (int i = 0; i < 32; i++) {
++		new_machine_id[i] = hex_chars[(machine_id_seed + i * 7) % 16];
++	}
++	new_machine_id[32] = '\0';
++	int machine_id_fd = open("/etc/machine-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
++	if (machine_id_fd >= 0) {
++		write(machine_id_fd, new_machine_id, 32);
++		write(machine_id_fd, "\n", 1);
++		close(machine_id_fd);
++		ruri_log("{base}Generated /etc/machine-id: %s\n", new_machine_id);
++	}
++}
++
++/*
++ * Validate and fix /etc/machine-id for systemd.
++ * If it doesn't exist or is empty, generate a new one.
++ */
++static void setup_machine_id(int container_id)
++{
++	int machine_id_fd = open("/etc/machine-id", O_RDONLY | O_CLOEXEC);
++	if (machine_id_fd >= 0) {
++		char machine_id_buf[64] = { 0 };
++		ssize_t machine_id_len = read(machine_id_fd, machine_id_buf, sizeof(machine_id_buf) - 1);
++		close(machine_id_fd);
++		/* Check if file is empty or contains only whitespace */
++		bool machine_id_valid = false;
++		if (machine_id_len > 0) {
++			machine_id_buf[machine_id_len] = '\0';
++			for (ssize_t i = 0; i < machine_id_len; i++) {
++				if (machine_id_buf[i] != ' ' && machine_id_buf[i] != '\t' && machine_id_buf[i] != '\n' && machine_id_buf[i] != '\r') {
++					machine_id_valid = true;
++					break;
++				}
++			}
++		}
++		if (!machine_id_valid) {
++			generate_machine_id(container_id);
++		}
++	} else {
++		/* File doesn't exist, create one */
++		generate_machine_id(container_id);
++	}
++}
++
++/*
++ * Mount host dbus socket for systemd communication.
++ * The /run/dbus directory must already exist.
++ */
++static void mount_host_dbus_socket(void)
++{
++	if (access("/run/dbus/system_bus_socket", F_OK) == 0) {
++		mount("/run/dbus/system_bus_socket", "/run/dbus/system_bus_socket", NULL, MS_BIND, NULL);
++		ruri_log("{base}Mounted host dbus socket to container\n");
++	} else if (access("/var/run/dbus/system_bus_socket", F_OK) == 0) {
++		mount("/var/run/dbus/system_bus_socket", "/run/dbus/system_bus_socket", NULL, MS_BIND, NULL);
++		ruri_log("{base}Mounted host dbus socket (from /var/run) to container\n");
++	} else {
++		ruri_log("{base}Host dbus socket not found, systemd will start its own dbus-daemon\n");
++	}
++}
++
++/*
++ * Setup complete systemd runtime environment.
++ * This includes all directories and files systemd needs to function.
++ */
++static void setup_systemd_runtime(struct RURI_CONTAINER *_Nonnull container)
++{
++	int res = 0;
++
++	/* Mount tmpfs for runtime directories */
++	mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
++	mkdir("/run/lock", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
++	mount("tmpfs", "/run/lock", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
++	mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
++
++	/* Create systemd runtime directories */
++	mkdir("/run/systemd", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
++	mkdir("/run/systemd/system", S_IRUSR | S_IWUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
++	int systemd_container_config_fd = open("/run/systemd/container", O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
++	if (systemd_container_config_fd >= 0) {
++		write(systemd_container_config_fd, "ruri", strlen("ruri"));
++		close(systemd_container_config_fd);
++	}
++
++	/* Create journal runtime directory */
++	mkdir("/run/log", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
++	mkdir("/run/log/journal", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
++
++	/* Create dbus runtime directory */
++	mkdir("/run/dbus", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
++
++	/* Ensure /dev/console exists for systemd */
++	if (access("/dev/console", F_OK) != 0) {
++		res = mknod("/dev/console", S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, makedev(5, 1));
++		if (res == 0) {
++			chown("/dev/console", 0, 5);
++			chmod("/dev/console", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++		}
++	}
++
++	/* Setup /etc/machine-id */
++	setup_machine_id(container->container_id);
++
++	/* Mount host dbus socket */
++	mount_host_dbus_socket();
++}
++#endif
++
+ // Run after chroot(2), called by ruri_run_chroot_container().
+ static void init_container(struct RURI_CONTAINER *_Nonnull container)
+ {
+@@ -207,105 +325,8 @@ static void init_container(struct RURI_CONTAINER *_Nonnull container)
+ 		chmod("/dev/tty0", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+ #ifndef DISABLE_SYSTEMD
+ 		if (container->systemd_mode) {
+-			/*
+-			 * Mount tmpfs for runtime directories.
+-			 * This is required for systemd to function properly.
+-			 */
+-			mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
+-			mkdir("/run/lock", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
+-			mount("tmpfs", "/run/lock", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
+-			mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=65536k,mode=755");
+-
+-			/*
+-			 * Create systemd runtime directories.
+-			 */
+-			mkdir("/run/systemd", S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH | S_IRGRP | S_IWGRP);
+-			mkdir("/run/systemd/system", S_IRUSR | S_IWUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+-			int systemd_container_config_fd = open("/run/systemd/container", O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+-			if (systemd_container_config_fd >= 0) {
+-				write(systemd_container_config_fd, "ruri", strlen("ruri"));
+-				close(systemd_container_config_fd);
+-			}
+-
+-			/*
+-			 * Create journal runtime directory.
+-			 */
+-			mkdir("/run/log", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+-			mkdir("/run/log/journal", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+-
+-			/*
+-			 * Ensure /dev/console exists for systemd.
+-			 * Console device is major 5, minor 1.
+-			 */
+-			if (access("/dev/console", F_OK) != 0) {
+-				res = mknod("/dev/console", S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, makedev(5, 1));
+-				if (res == 0) {
+-					chown("/dev/console", 0, 5);
+-					chmod("/dev/console", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+-				}
+-			}
+-
+-			/*
+-			 * Handle /etc/machine-id for systemd.
+-			 * If it doesn't exist or is empty, generate a unique ID.
+-			 */
+-			int machine_id_fd = open("/etc/machine-id", O_RDONLY | O_CLOEXEC);
+-			if (machine_id_fd >= 0) {
+-				char machine_id_buf[64] = { 0 };
+-				ssize_t machine_id_len = read(machine_id_fd, machine_id_buf, sizeof(machine_id_buf) - 1);
+-				close(machine_id_fd);
+-				/* Check if file is empty or contains only whitespace */
+-				bool machine_id_valid = false;
+-				if (machine_id_len > 0) {
+-					machine_id_buf[machine_id_len] = '\0';
+-					for (ssize_t i = 0; i < machine_id_len; i++) {
+-						if (machine_id_buf[i] != ' ' && machine_id_buf[i] != '\t' && machine_id_buf[i] != '\n' && machine_id_buf[i] != '\r') {
+-							machine_id_valid = true;
+-							break;
+-						}
+-					}
+-				}
+-				if (!machine_id_valid) {
+-					/* Generate a simple machine-id based on container_id and time */
+-					unsigned int machine_id_seed = (unsigned int)time(NULL) ^ (unsigned int)container->container_id;
+-					char new_machine_id[33];
+-					const char *hex_chars = "0123456789abcdef";
+-					for (int i = 0; i < 32; i++) {
+-						new_machine_id[i] = hex_chars[(machine_id_seed + i * 7) % 16];
+-					}
+-					new_machine_id[32] = '\0';
+-					machine_id_fd = open("/etc/machine-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+-					if (machine_id_fd >= 0) {
+-						write(machine_id_fd, new_machine_id, 32);
+-						write(machine_id_fd, "\n", 1);
+-						close(machine_id_fd);
+-						ruri_log("{base}Generated /etc/machine-id: %s\n", new_machine_id);
+-					}
+-				}
+-			} else {
+-				/* File doesn't exist, create one */
+-				unsigned int machine_id_seed = (unsigned int)time(NULL) ^ (unsigned int)container->container_id;
+-				char new_machine_id[33];
+-				const char *hex_chars = "0123456789abcdef";
+-				for (int i = 0; i < 32; i++) {
+-					new_machine_id[i] = hex_chars[(machine_id_seed + i * 7) % 16];
+-				}
+-				new_machine_id[32] = '\0';
+-				machine_id_fd = open("/etc/machine-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+-				if (machine_id_fd >= 0) {
+-					write(machine_id_fd, new_machine_id, 32);
+-					write(machine_id_fd, "\n", 1);
+-					close(machine_id_fd);
+-					ruri_log("{base}Generated /etc/machine-id: %s\n", new_machine_id);
+-				}
+-			}
+-
+-			/*
+-			 * Create dbus runtime directory if dbus support is enabled.
+-			 */
+-			if (container->systemd_dbus) {
+-				mkdir("/run/dbus", S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+-			}
++			/* Setup systemd runtime environment (includes dbus support) */
++			setup_systemd_runtime(container);
+ 		}
+ #endif
+ 		if (!container->unmask_dirs) {
+diff --git a/src/config.c b/src/config.c
+index 11ffa0e..763c540 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -90,7 +90,6 @@ void ruri_init_config(struct RURI_CONTAINER *_Nonnull container)
+ 	container->skip_setgroups = false;
+ 	container->first_init = true;
+ 	container->systemd_mode = false;
+-	container->systemd_dbus = false;
+ }
+ static int pmcrts(const char *s1, const char *s2)
+ {
+@@ -394,6 +393,18 @@ char *ruri_container_info_to_k2v(const struct RURI_CONTAINER *_Nonnull container
+ 	// skip_setgroups.
+ 	ret = k2v_add_comment(ret, "Skip setgroups() call.");
+ 	ret = k2v_add_config(bool, ret, "skip_setgroups", container->skip_setgroups);
++	ret = k2v_add_newline(ret);
++	// systemd_mode.
++	ret = k2v_add_comment(ret, "Enable systemd mode.");
++	ret = k2v_add_comment(ret, "Requires unshare feature enabled.");
++	ret = k2v_add_comment(ret, "Also enables dbus support automatically.");
++	ret = k2v_add_comment(ret, "Default is false.");
++	ret = k2v_add_config(bool, ret, "systemd_mode", container->systemd_mode);
++	ret = k2v_add_newline(ret);
++	// first_init.
++	ret = k2v_add_comment(ret, "Mark if this is the first init process.");
++	ret = k2v_add_comment(ret, "Used internally for systemd mode.");
++	ret = k2v_add_config(bool, ret, "first_init", container->first_init);
+ 	return ret;
+ }
+ void ruri_read_config(struct RURI_CONTAINER *_Nonnull container, const char *_Nonnull path)
+@@ -411,7 +422,7 @@ void ruri_read_config(struct RURI_CONTAINER *_Nonnull container, const char *_No
+ 		ruri_error("{red}Failed to read config file:%s\n{clear}", path);
+ 	}
+ 	// Check if config is valid.
+-	char *key_list[] = { "timens_realtime_offset", "timens_monotonic_offset", "hidepid", "char_devs", "use_kvm", "no_network", "container_dir", "user", "drop_caplist", "no_new_privs", "enable_seccomp", "rootless", "no_warnings", "cross_arch", "qemu_path", "use_rurienv", "cpuset", "memory", "cpupercent", "just_chroot", "unmask_dirs", "mount_host_runtime", "work_dir", "rootfs_source", "ro_root", "extra_mountpoint", "extra_ro_mountpoint", "env", "command", "hostname", NULL };
++	char *key_list[] = { "timens_realtime_offset", "timens_monotonic_offset", "hidepid", "char_devs", "use_kvm", "no_network", "container_dir", "user", "drop_caplist", "no_new_privs", "enable_seccomp", "rootless", "no_warnings", "cross_arch", "qemu_path", "use_rurienv", "cpuset", "memory", "cpupercent", "just_chroot", "unmask_dirs", "mount_host_runtime", "work_dir", "rootfs_source", "ro_root", "extra_mountpoint", "extra_ro_mountpoint", "env", "command", "hostname", "systemd_mode", "first_init", NULL };
+ 	for (int i = 0; key_list[i] != NULL; i++) {
+ 		if (!have_key(key_list[i], buf)) {
+ 			ruri_error("{red}Invalid config file, there is no key:%s\nHint:\n You can try to use `ruri -C config` to fix the config file{clear}", key_list[i]);
+@@ -531,6 +542,10 @@ void ruri_read_config(struct RURI_CONTAINER *_Nonnull container, const char *_No
+ 	// Get command.
+ 	int comlen = k2v_get_key(char_array, "command", buf, container->command, RURI_MAX_COMMANDS);
+ 	container->command[comlen] = NULL;
++	// Get systemd_mode (implies dbus support).
++	container->systemd_mode = k2v_get_key(bool, "systemd_mode", buf);
++	// Get first_init.
++	container->first_init = k2v_get_key(bool, "first_init", buf);
+ 	free(buf);
+ 	buf = ruri_container_info_to_k2v(container);
+ 	ruri_log("{base}Container config in %s:{cyan}\n%s", path, buf);
+@@ -791,6 +806,18 @@ void ruri_correct_config(const char *_Nonnull path)
+ 	} else {
+ 		container.oom_score_adj = k2v_get_key(int, "oom_score_adj", buf);
+ 	}
++	if (!have_key("systemd_mode", buf)) {
++		ruri_warning("{green}No key systemd_mode found, set to false\n{clear}");
++		container.systemd_mode = false;
++	} else {
++		container.systemd_mode = k2v_get_key(bool, "systemd_mode", buf);
++	}
++	if (!have_key("first_init", buf)) {
++		ruri_warning("{green}No key first_init found, set to true\n{clear}");
++		container.first_init = true;
++	} else {
++		container.first_init = k2v_get_key(bool, "first_init", buf);
++	}
+ 	free(buf);
+ 	unlink(path);
+ 	remove(path);
+diff --git a/src/include/ruri.h b/src/include/ruri.h
+index 0c67148..bd96591 100644
+--- a/src/include/ruri.h
++++ b/src/include/ruri.h
+@@ -215,10 +215,8 @@ struct RURI_CONTAINER {
+ 	bool skip_setgroups;
+ 	// First init.
+ 	bool first_init;
+-	// Systemd mode.
++	// Systemd mode (implies dbus support).
+ 	bool systemd_mode;
+-	// Systemd dbus support.
+-	bool systemd_dbus;
+ };
+ // For ruri_get_magic().
+ #define ruri_magicof(x) (x##_magic)
+diff --git a/src/info.c b/src/info.c
+index a831505..6edc8f3 100644
+--- a/src/info.c
++++ b/src/info.c
+@@ -149,8 +149,7 @@ void ruri_show_helps(void)
+ 	cprintf("{base}  -O, --oom-score-adj [score] .................: Set oom_score_adj for container (*14)\n");
+ 	cprintf("{base} -Q, --mask-path [path] ......................: Mask a path in the container\n");
+ #ifndef DISABLE_SYSTEMD
+-	cprintf("{base} -Z, --systemd .............................: Run container with systemd support (*15)\n");
+-	cprintf("{base}     --systemd-dbus ..........................: Enable dbus support for systemd (*15)\n");
++	cprintf("{base} -Z, --systemd .............................: Run container with systemd support (includes dbus) (*15)\n");
+ #endif
+ 	cprintf("{base} -z, --enable-tty-signals ....................: Enable TTY signals in the container (*16)\n");
+ 	cprintf("{base}  -g, --skip-setgroups ........................: Skip setgroups() call\n");
+diff --git a/src/ruri.c b/src/ruri.c
+index e11bbd5..3b0f33c 100644
+--- a/src/ruri.c
++++ b/src/ruri.c
+@@ -709,8 +709,6 @@ static void parse_args(int argc, char **_Nonnull argv, struct RURI_CONTAINER *_N
+ #ifndef DISABLE_SYSTEMD
+ 		else if (strcmp(argv[index], "-Z") == 0 || strcmp(argv[index], "--systemd") == 0) {
+ 			container->systemd_mode = true;
+-		} else if (strcmp(argv[index], "--systemd-dbus") == 0) {
+-			container->systemd_dbus = true;
+ 		}
+ #endif
+ 		// If use_config_file is true.
+-- 
+2.53.0
+
